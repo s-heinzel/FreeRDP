@@ -83,6 +83,11 @@
 #include "tcp.h"
 #include "../crypto/opensslcompat.h"
 
+#ifdef AF_VSOCK
+#include <ctype.h>
+#include <linux/vm_sockets.h>
+#endif
+
 #define TAG FREERDP_TAG("core")
 
 /* Simple Socket BIO */
@@ -1074,6 +1079,7 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 	socklen_t optlen;
 	BOOL ipcSocket = FALSE;
 	BOOL useExternalDefinedSocket = FALSE;
+	BOOL useVsock = TRUE;
 
 	if (!hostname)
 	{
@@ -1088,6 +1094,14 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 	if (hostname[0] == '|')
 		useExternalDefinedSocket = TRUE;
 
+	for (int i = 0; i < strlen(hostname); i++)
+	{
+		if (!isdigit(hostname[i]))
+		{
+			useVsock = FALSE;
+		}
+	}
+
 	if (ipcSocket)
 	{
 		sockfd = freerdp_uds_connect(hostname);
@@ -1101,6 +1115,27 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 	}
 	else if (useExternalDefinedSocket)
 		sockfd = port;
+#ifdef AF_VSOCK
+	else if (useVsock)
+	{
+		sockfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+		struct sockaddr_vm addr;
+		memset(&addr, 0, sizeof(struct sockaddr_vm));
+		addr.svm_family = AF_VSOCK;
+		addr.svm_port = port;
+		char* ptr;
+		addr.svm_cid = strtol(hostname, &ptr, 10);
+		if (addr.svm_cid == 2)
+		{
+			addr.svm_flags = VMADDR_FLAG_TO_HOST;
+		}
+		if ((connect(sockfd, (struct sockaddr*)&addr, sizeof(struct sockaddr_vm))) == -1)
+		{
+			WLog_ERR(TAG, "failed to connect to %s", hostname);
+			return -1;
+		}
+	}
+#endif
 	else
 	{
 		sockfd = -1;
@@ -1149,7 +1184,6 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 				if (!addr)
 					addr = result;
 			}
-
 			sockfd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
 
 			if (sockfd < 0)
@@ -1159,7 +1193,6 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 				freeaddrinfo(result);
 				return -1;
 			}
-
 			if ((peerAddress = freerdp_tcp_address_to_string(
 			         (const struct sockaddr_storage*)addr->ai_addr, NULL)) != NULL)
 			{
@@ -1183,18 +1216,21 @@ int freerdp_tcp_default_connect(rdpContext* context, rdpSettings* settings, cons
 		}
 	}
 
-	free(settings->ClientAddress);
-	settings->ClientAddress = freerdp_tcp_get_ip_address(sockfd, &settings->IPv6Enabled);
-
-	if (!settings->ClientAddress)
+	if (!useVsock)
 	{
-		if (!useExternalDefinedSocket)
-			close(sockfd);
+		free(settings->ClientAddress);
+		settings->ClientAddress = freerdp_tcp_get_ip_address(sockfd, &settings->IPv6Enabled);
 
-		freerdp_set_last_error_if_not(context, FREERDP_ERROR_CONNECT_FAILED);
+		if (!settings->ClientAddress)
+		{
+			if (!useExternalDefinedSocket)
+				close(sockfd);
 
-		WLog_ERR(TAG, "Couldn't get socket ip address");
-		return -1;
+			freerdp_set_last_error_if_not(context, FREERDP_ERROR_CONNECT_FAILED);
+
+			WLog_ERR(TAG, "Couldn't get socket ip address");
+			return -1;
+		}
 	}
 
 	optval = 1;

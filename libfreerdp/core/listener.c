@@ -40,6 +40,11 @@
 #include <net/if.h>
 #endif
 
+#ifdef AF_VSOCK
+#include <ctype.h>
+#include <linux/vm_sockets.h>
+#endif
+
 #include <winpr/handle.h>
 
 #include "listener.h"
@@ -60,9 +65,70 @@ static BOOL freerdp_listener_open(freerdp_listener* instance, const char* bind_a
 #ifdef _WIN32
 	u_long arg;
 #endif
+	BOOL useVsock = TRUE;
 
 	if (!bind_address)
 		ai_flags = AI_PASSIVE;
+
+	for (int i = 0; i < strlen(bind_address); i++)
+	{
+		if (!isdigit(bind_address[i]) && bind_address[i] != '-')
+		{
+			useVsock = FALSE;
+		}
+	}
+
+	if (useVsock)
+	{
+		sockfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+		if (sockfd == -1)
+		{
+			WLog_ERR(TAG, "Error creating socket: %s", strerror(errno));
+			return FALSE;
+		}
+		int flags = fcntl(sockfd, F_GETFL, 0);
+		if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1)
+		{
+			WLog_ERR(TAG, "Error making socket nonblocking: %s", strerror(errno));
+			closesocket((SOCKET)sockfd);
+			return FALSE;
+		}
+		struct sockaddr_vm addr;
+		memset(&addr, 0, sizeof(struct sockaddr_vm));
+		addr.svm_family = AF_VSOCK;
+		addr.svm_port = port;
+		char* ptr;
+		addr.svm_cid = strtol(bind_address, &ptr, 10);
+		if (bind(sockfd, (struct sockaddr*)&addr, sizeof(struct sockaddr_vm)) == -1)
+		{
+			WLog_ERR(TAG, "Error binding vsock at cid %d port %d: %s", addr.svm_cid, port,
+			         strerror(errno));
+			closesocket((SOCKET)sockfd);
+			return FALSE;
+		}
+
+		if (listen(sockfd, 10) == -1)
+		{
+			WLog_ERR(TAG, "Error listening to socket at cid %d port %d: %s", addr.svm_cid, port,
+			         strerror(errno));
+			closesocket((SOCKET)sockfd);
+			return FALSE;
+		}
+		listener->sockfds[listener->num_sockfds] = sockfd;
+		listener->events[listener->num_sockfds] = WSACreateEvent();
+
+		if (!listener->events[listener->num_sockfds])
+		{
+			listener->num_sockfds = 0;
+		}
+
+		WSAEventSelect(sockfd, listener->events[listener->num_sockfds],
+		               FD_READ | FD_ACCEPT | FD_CLOSE);
+		listener->num_sockfds++;
+
+		WLog_INFO(TAG, "Listening on %s:%d", bind_address, port);
+		return TRUE;
+	}
 
 	res = freerdp_tcp_resolve_host(bind_address, port, ai_flags);
 
